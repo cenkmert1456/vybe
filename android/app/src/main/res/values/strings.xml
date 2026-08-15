@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">VYBE</string>
+    <string name="title_activity_main">VYBE</string>
+    <string name="package_name">com.vybe.app</string>
+    <string name="custom_url_scheme">com.vybe.app</string>
+</resources>

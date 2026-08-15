@@ -1,0 +1,97 @@
+name: Android Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify VITE_CONVEX_URL is configured
+        # An APK built without the backend URL shows only the welcome screen
+        # and cannot sign in or load data. Add a repository secret named
+        # VITE_CONVEX_URL (e.g. https://your-project.convex.cloud). This step
+        # fails the build — and no APK is uploaded — when it is missing.
+        env:
+          VITE_CONVEX_URL: ${{ secrets.VITE_CONVEX_URL }}
+        run: bun scripts/verify-convex-url.mjs
+
+      - name: Generate Convex types (codegen, best-effort)
+        # src/convex/_generated is committed to the repo so tsc works without
+        # Convex credentials. Regenerate when possible to catch stale types;
+        # skip silently if codegen can't reach a deployment in CI.
+        run: bun convex codegen --typecheck disable || echo "codegen skipped (no Convex credentials) — using committed generated types"
+
+      - name: Typecheck
+        run: bun tsc -b --noEmit
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Build web application
+        run: bun run build
+        env:
+          VITE_CONVEX_URL: ${{ secrets.VITE_CONVEX_URL }}
+
+      - name: Generate app icons
+        run: bun scripts/generate-icons.mjs
+
+      - name: Sync Capacitor (Android)
+        run: npx cap sync android
+
+      - name: Verify bundled web assets are in the APK project
+        # Prevents shipping an APK that opens https://localhost with
+        # "webpage not found" (missing assets/public bundle).
+        run: bun scripts/verify-bundle.mjs
+
+      - name: Point Gradle at the Android SDK
+        run: echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Upload debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vybe-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Verify APK exists
+        run: |
+          test -f android/app/build/outputs/apk/debug/app-debug.apk \
+            && echo "✅ Debug APK built successfully" \
+            || { echo "❌ APK missing — build failed"; exit 1; }

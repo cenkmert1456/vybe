@@ -1,0 +1,218 @@
+import { v } from "convex/values";
+import { mutation, query } from "./_generated/server";
+import { currentUserId, getMyProfile, nowMs } from "./helpers";
+
+/**
+ * Free, automatic, on-device profile liveness verification.
+ *
+ * The camera + face analysis runs entirely on the device (MediaPipe
+ * FaceLandmarker bundled with the app — no external verification service, no
+ * API keys). The backend owns the *authoritative* state transition: it only
+ * stamps a profile as verified after validating a complete challenge session
+ * with a minimum confidence score. No video or frames are ever uploaded; the
+ * server stores only minimal metrics (score, frame count, duration).
+ *
+ * Statuses (user-facing): unverified → in_progress → verified | failed.
+ */
+
+const CHALLENGES = [
+  "blink",
+  "turn_left",
+  "turn_right",
+  "look_up",
+  "look_down",
+  "smile",
+] as const;
+type Challenge = (typeof CHALLENGES)[number];
+
+/** Minimum confidence score the on-device check must report. */
+export const MIN_LIVENESS_SCORE = 65;
+/** Minimum analyzed frames (a static image can never reach this). */
+export const MIN_FRAMES = 60;
+/** Maximum retries per user before asking them to contact support. */
+export const MAX_RETRIES = 8;
+
+function shuffle<T>(arr: readonly T[]): T[] {
+  const out = [...arr];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+function isChallenge(c: string): c is Challenge {
+  return (CHALLENGES as readonly string[]).includes(c);
+}
+
+/** Current verification state for the signed-in user. */
+export const myVerification = query({
+  args: {},
+  handler: async (ctx) => {
+    const me = await getMyProfile(ctx);
+    if (!me) return null;
+    if (me.verified) {
+      return {
+        status: "verified" as const,
+        verified: true,
+        score: me.verificationMeta?.score ?? null,
+        verifiedAt: me.verificationMeta?.verifiedAt ?? null,
+      };
+    }
+    const row = await ctx.db
+      .query("verifications")
+      .withIndex("by_user_latest", (q) => q.eq("userId", me.userId as any))
+      .order("desc")
+      .first();
+    if (!row || row.status === "failed") {
+      return { status: row?.status === "failed" ? ("failed" as const) : ("unverified" as const), verified: false };
+    }
+    return { status: "in_progress" as const, verified: false, retryCount: row.retryCount };
+  },
+});
+
+/** Begin a fresh verification session with a randomized challenge order. */
+export const startVerification = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const userId = await currentUserId(ctx);
+    if (!userId) throw new Error("Not authenticated");
+    const me = await getMyProfile(ctx);
+    if (!me) throw new Error("Complete onboarding first");
+    if (me.verified) throw new Error("Already verified");
+
+    const sequence = shuffle(CHALLENGES).slice(0, 3);
+    const now = nowMs();
+    const id = await ctx.db.insert("verifications", {
+      userId,
+      profileId: me._id,
+      provider: "on_device",
+      status: "in_progress",
+      challengeSequence: sequence,
+      challengeResults: [],
+      createdAt: now,
+      retryCount: 0,
+    });
+    await ctx.db.insert("analytics", {
+      profileId: me._id,
+      event: "verification_started",
+      createdAt: now,
+    });
+    return { sessionId: id.toString(), challengeSequence: sequence };
+  },
+});
+
+/**
+ * Submit the completed on-device liveness run. The server validates that:
+ *  - the session exists, belongs to this user and is in progress,
+ *  - every challenge in the randomized sequence was completed,
+ *  - the reported confidence score and frame count meet the minimums.
+ * Only then is the verified badge activated. A frontend-only claim (missing
+ * challenges, low score, or a stale session) is never accepted.
+ */
+export const submitLiveness = mutation({
+  args: {
+    sessionId: v.id("verifications"),
+    results: v.array(v.string()),
+    capturedAt: v.array(v.number()),
+    score: v.number(),
+    frames: v.number(),
+    durationMs: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const me = await getMyProfile(ctx);
+    if (!me) throw new Error("Not authenticated");
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.userId !== me.userId) throw new Error("Session not found");
+    if (session.status !== "in_progress") throw new Error("Session is not active");
+    if (me.verified) throw new Error("Already verified");
+
+    const sequence = session.challengeSequence;
+    if (args.results.length !== sequence.length) throw new Error("Incomplete verification");
+    if (!args.results.every(isChallenge)) throw new Error("Invalid challenge result");
+    const expected = new Set<string>(sequence);
+    const received = new Set<string>(args.results);
+    if (expected.size !== received.size || [...expected].some((c) => !received.has(c))) {
+      throw new Error("Incomplete verification");
+    }
+
+    const now = nowMs();
+    const passed =
+      args.score >= MIN_LIVENESS_SCORE &&
+      args.frames >= MIN_FRAMES &&
+      args.results.length === sequence.length;
+
+    await ctx.db.patch(session._id, {
+      status: passed ? "verified" : "failed",
+      challengeResults: args.results,
+      score: Math.round(args.score),
+      frames: args.frames,
+      durationMs: Math.round(args.durationMs),
+      completedAt: now,
+      failureReason: passed ? undefined : "low_confidence",
+    });
+
+    if (passed) {
+      await ctx.db.patch(me._id, {
+        verified: true,
+        verificationStatus: "verified",
+        verificationMeta: {
+          verifiedAt: now,
+          method: "on_device_liveness",
+          score: Math.round(args.score),
+        },
+      });
+      await ctx.db.insert("analytics", {
+        profileId: me._id,
+        event: "verification_completed",
+        createdAt: now,
+      });
+    } else {
+      await ctx.db.patch(me._id, { verificationStatus: "failed" });
+      await ctx.db.insert("analytics", {
+        profileId: me._id,
+        event: "verification_failed",
+        createdAt: now,
+      });
+    }
+
+    return { status: passed ? "verified" : "failed", score: Math.round(args.score) };
+  },
+});
+
+/** Retry after a failure — fresh session, new random challenge order. */
+export const retryVerification = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const userId = await currentUserId(ctx);
+    if (!userId) throw new Error("Not authenticated");
+    const me = await getMyProfile(ctx);
+    if (!me) throw new Error("Complete onboarding first");
+    if (me.verified) throw new Error("Already verified");
+
+    const latest = await ctx.db
+      .query("verifications")
+      .withIndex("by_user_latest", (q) => q.eq("userId", userId))
+      .order("desc")
+      .first();
+    const retryCount = (latest?.retryCount ?? 0) + 1;
+    if (retryCount > MAX_RETRIES) {
+      throw new Error(
+        "You've tried verification many times. Please contact support so we can help you directly.",
+      );
+    }
+
+    const sequence = shuffle(CHALLENGES).slice(0, 3);
+    const id = await ctx.db.insert("verifications", {
+      userId,
+      profileId: me._id,
+      provider: "on_device",
+      status: "in_progress",
+      challengeSequence: sequence,
+      challengeResults: [],
+      createdAt: nowMs(),
+      retryCount,
+    });
+    return { sessionId: id.toString(), challengeSequence: sequence, retryCount };
+  },
+});

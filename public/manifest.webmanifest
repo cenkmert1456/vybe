@@ -1,0 +1,17 @@
+{
+  "name": "VYBE",
+  "short_name": "VYBE",
+  "description": "Feel the vibe. Find your people. Global social discovery and dating.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b0b12",
+  "theme_color": "#0b0b12",
+  "icons": [
+    {
+      "src": "/logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+name: iOS Check
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-ios:
+    name: Validate iOS project
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Generate Convex types (codegen, best-effort)
+        # src/convex/_generated is committed to the repo so tsc works without
+        # Convex credentials. Regenerate when possible to catch stale types;
+        # skip silently if codegen can't reach a deployment in CI.
+        run: bun convex codegen --typecheck disable || echo "codegen skipped (no Convex credentials) — using committed generated types"
+
+      - name: Typecheck
+        run: bun tsc -b --noEmit
+
+      - name: Build web application
+        run: bun run build
+
+      - name: Generate app icons
+        run: bun scripts/generate-icons.mjs
+
+      - name: Sync Capacitor (iOS)
+        run: npx cap sync ios
+
+      - name: Validate iOS project structure
+        run: |
+          test -f ios/App/App.xcodeproj/project.pbxproj \
+            && echo "✅ Xcode project present" || { echo "❌ Xcode project missing"; exit 1; }
+          test -f ios/App/App/Info.plist \
+            && echo "✅ Info.plist present" || { echo "❌ Info.plist missing"; exit 1; }
+
+      - name: Compile iOS app (unsigned simulator build)
+        working-directory: ios/App
+        run: |
+          xcodebuild \
+            -project App.xcodeproj \
+            -scheme App \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
